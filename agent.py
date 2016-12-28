@@ -12,9 +12,10 @@ from collections import deque
 
 class ReplayMemmory:
 
-    def __init__(self, size=100000):
+    def __init__(self, size=100000, batch_size=64):
         self.size = size
         self.queue = deque(maxlen=size)
+        self.batch_size = batch_size
         random.seed(42)
 
     @property
@@ -24,8 +25,8 @@ class ReplayMemmory:
     def add(self, state, action, reward, next_state, done):
         self.queue.append((state, action, reward, next_state, done))
 
-    def sample(self, size=512):
-        batch = random.sample(self.queue, size)
+    def sample(self):
+        batch = random.sample(self.queue, self.batch_size)
         states, actions, rewards, next_states, dones = [], [], [], [], []
         for s, a, r, ns, d in batch:
             states.append(s)
@@ -49,26 +50,31 @@ def copy_params(src_net, dest_net, tau=0.001):
 
 class TargetActor:
 
-    def __init__(self, env):
+    def __init__(self, env, snapshot=None):
         self.input_state = T.fmatrix('input_state')
         self.state_in = lasagne.layers.InputLayer((None, 24), self.input_state)
 
         self.l_hid1 = lasagne.layers.DenseLayer(
-            self.state_in, num_units=256,
+            self.state_in, num_units=400,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 
         self.l_hid2 = lasagne.layers.DenseLayer(
-            self.l_hid1, num_units=256,
+            self.l_hid1, num_units=300,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 	
         self.net = lasagne.layers.DenseLayer(
             self.l_hid2, num_units=4,
             nonlinearity=lasagne.nonlinearities.tanh,
-            W=lasagne.init.GlorotUniform(),
+            W=(np.random.sample(size=(300, 4)) * 1e-4 - 5e-5) ,
             b=None
         )
+
+        if snapshot:
+            with open(snapshot, 'rb') as f:
+                params = pickle.load(f)
+            lasagne.layers.set_all_param_values(self.net, params)
 
         self.output = lasagne.layers.get_output(self.net, deterministic=True)
 
@@ -84,10 +90,10 @@ class TargetActor:
     def get_action(self, state):
         return self.get_actions(state[np.newaxis, ...]).squeeze()
 
-    def save_params(self):
-        pass
+    def save_params(self, filename="snapshots/actor.pkl"):
+        with open(filename, 'wb') as f:
+            pickle.dump(lasagne.layers.get_all_param_values(self.net), f,  pickle.HIGHEST_PROTOCOL)
 
-        
 class LearningActor(TargetActor):
 
     def __init__(self, env, learning_rate=0.0001):
@@ -111,7 +117,7 @@ class LearningActor(TargetActor):
 
 class TargetCritic:
     
-    def __init__(self, env, learning_rate=0.01):
+    def __init__(self, env, learning_rate=0.001):
         self.input_state = T.fmatrix('input_state')
         self.input_action = T.fmatrix('input_action')
 
@@ -119,21 +125,27 @@ class TargetCritic:
         self.action_in = lasagne.layers.InputLayer((None, 4), self.input_action)
 
         self.l_hid1 = lasagne.layers.DenseLayer(
-            self.state_in, num_units=256,
+            self.state_in, num_units=400,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 
-        self.l_hid2 = lasagne.layers.DenseLayer(
-            self.action_in, num_units=256,
+        self.l_acts = lasagne.layers.DenseLayer(
+            self.action_in, num_units=400,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 	
-        self.l_sum = lasagne.layers.ElemwiseSumLayer([self.l_hid1, self.l_hid2])
+        self.l_sum = lasagne.layers.ElemwiseSumLayer([self.l_hid1, self.l_acts])
+
+        self.l_hid2 = lasagne.layers.DenseLayer(
+            self.l_sum, num_units=300,
+            nonlinearity=lasagne.nonlinearities.rectify,
+            W=lasagne.init.GlorotUniform())
+
 	
         self.net = lasagne.layers.DenseLayer(
-            self.l_sum, num_units=1,
+            self.l_hid2, num_units=1,
             nonlinearity=None,
-            W=lasagne.init.GlorotUniform())
+            W=(np.random.sample(size=(300, 1)) * 1e-4 - 5e-5))
 
         self.output = lasagne.layers.get_output(self.net, deterministic=True)
 
@@ -156,7 +168,8 @@ class LearningCritic(TargetCritic):
         self.input_target = T.fvector('input_target')
 
         params = lasagne.layers.get_all_params(self.net, trainable=True)
-        loss = T.sqr(self.output - self.input_target).mean()
+        l2_penalty = lasagne.regularization.regularize_network_params(self.net, lasagne.regularization.l2) * 1e-2
+        loss = T.sqr(self.output - self.input_target).mean() + l2_penalty
         updates = lasagne.updates.adam(loss, params, learning_rate=learning_rate)
 
         self.train = theano.function(
@@ -178,6 +191,7 @@ if __name__ == "__main__":
     np.random.seed(42)
     NUM_EPISODES = 1000
     R = 0. # total reward
+    max_epr = -np.inf
     gamma = 0.99
 
     env = gym.make('BipedalWalker-v2')
@@ -187,7 +201,7 @@ if __name__ == "__main__":
     target_critic = TargetCritic(env)
     target_actor = TargetActor(env)
 
-    replay_mem = ReplayMemmory(size=10000)
+    replay_mem = ReplayMemmory(size=10000, batch_size=64)
     
     try:
         for ep in range(NUM_EPISODES):
@@ -200,11 +214,12 @@ if __name__ == "__main__":
                 action = target_actor.get_action(curr_s)
                 s, r, done, _ = env.step(action)
                 s, r  = floatX(s), floatX(r)
-                done = done or env.hull.position.y < 5.0
+                done = done or env.hull.position.y < 4.0
                 # print(action)   
                 replay_mem.add(curr_s, action, r, s, done) 
-                curr_s = s
-               
+                curr_s = s 
+                ep_R += r
+              
                 if replay_mem.full:
                     states, actions, rewards, next_states, dones = replay_mem.sample()
 
@@ -219,10 +234,11 @@ if __name__ == "__main__":
 
                     copy_params(l_actor, target_actor)
                     copy_params(l_critic, target_critic)
-                    
-                    
-            ep_R += r
-			        
+
+            if ep_R > max_epr or (ep % 100) == 0:
+                target_actor.save_params("snapshots/{0}_{1:.3f}.pkl".format(ep, ep_R))
+                max_epr = max(ep_R, max_epr)
+                
             print("[Episode {}] Got reward of {} critic loss was {}".format(ep, ep_R, np.mean(losses)))
             R += ep_R
 
