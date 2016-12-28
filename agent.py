@@ -5,6 +5,8 @@ import random
 import theano 
 import theano.tensor as T
 import lasagne
+from lasagne.utils import floatX
+import pickle
 from collections import deque
 
 
@@ -32,119 +34,145 @@ class ReplayMemmory:
             next_states.append(ns)
             dones.append(float(d))
         return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(dones)          
+
+
+def copy_params(src_net, dest_net, tau=0.001):
+    src_params = lasagne.layers.get_all_param_values(src_net.net)
+    dest_params = lasagne.layers.get_all_params(dest_net.net)
+    mtau = 1 - tau
     
-
-class Actor:
-
-    def __init__(self, env, learning_rate=0.0001):
-        input_state = T.dmatrix('input_state')
-        grad_from_critic = T.dmatrix('c_grads')
-
+    assert len(src_params) == len(dest_params)
+    for src_p, dest_p in zip(src_params, dest_params):
         
-        state_in = lasagne.layers.InputLayer((None, 24), input_state)
+        dest_p.set_value(tau * src_p + mtau * dest_p.get_value())
 
-        l_hid1 = lasagne.layers.DenseLayer(
-            state_in, num_units=256,
+
+class TargetActor:
+
+    def __init__(self, env):
+        self.input_state = T.fmatrix('input_state')
+        self.state_in = lasagne.layers.InputLayer((None, 24), self.input_state)
+
+        self.l_hid1 = lasagne.layers.DenseLayer(
+            self.state_in, num_units=256,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 
-        l_hid2 = lasagne.layers.DenseLayer(
-            l_hid1, num_units=256,
+        self.l_hid2 = lasagne.layers.DenseLayer(
+            self.l_hid1, num_units=256,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 	
-        actions = lasagne.layers.DenseLayer(
-            l_hid2, num_units=4,
+        self.net = lasagne.layers.DenseLayer(
+            self.l_hid2, num_units=4,
             nonlinearity=lasagne.nonlinearities.tanh,
             W=lasagne.init.GlorotUniform(),
             b=None
         )
 
-        params = lasagne.layers.get_all_params(actions, trainable=True)
-        prediction = lasagne.layers.get_output(actions, deterministic=True)
+        self.output = lasagne.layers.get_output(self.net, deterministic=True)
 
         self.predict_fn = theano.function(
-            [input_state],
-            prediction
-        )
-
-        grads = theano.gradient.grad(None, params, known_grads={prediction: -1 * grad_from_critic})
-
-        updates = lasagne.updates.adam(grads, params, learning_rate=learning_rate)
-        
-        self.train_fn = theano.function(
-            [input_state, grad_from_critic],
-            prediction,
-            updates=updates
+            [self.input_state],
+            self.output,
+            allow_input_downcast=True
         )
 
     def get_actions(self, states):
         return self.predict_fn(states)
-
+        
     def get_action(self, state):
-        return self.predict_fn(state[np.newaxis, ...]).squeeze()
-    
-    def train(self, states, gradients):
-        return self.train_fn(states, gradients)
-       
+        return self.get_actions(state[np.newaxis, ...]).squeeze()
 
-class Critic:
+    def save_params(self):
+        pass
+
+        
+class LearningActor(TargetActor):
+
+    def __init__(self, env, learning_rate=0.0001):
+        super(LearningActor, self).__init__(env)
+        self.grad_from_critic = T.fmatrix('c_grads')
+
+        params = lasagne.layers.get_all_params(self.net, trainable=True)
+        grads = theano.gradient.grad(None, params, known_grads={self.output: -1 * self.grad_from_critic})
+        updates = lasagne.updates.adam(grads, params, learning_rate=learning_rate)
+        
+        self.train = theano.function(
+            [self.input_state, self.grad_from_critic],
+            self.output,
+            updates=updates,
+            allow_input_downcast=True
+
+        )
+        self.params = params
+    
+
+
+class TargetCritic:
     
     def __init__(self, env, learning_rate=0.01):
-        input_reward = T.dvector('input_reward')
-        input_state = T.dmatrix('input_state')
-        input_action = T.dmatrix('input_action')
+        self.input_state = T.fmatrix('input_state')
+        self.input_action = T.fmatrix('input_action')
 
-        state_in = lasagne.layers.InputLayer((None, 24), input_state)
-        action_in = lasagne.layers.InputLayer((None, 4), input_action)
+        self.state_in = lasagne.layers.InputLayer((None, 24), self.input_state)
+        self.action_in = lasagne.layers.InputLayer((None, 4), self.input_action)
 
-        l_hid1 = lasagne.layers.DenseLayer(
-            state_in, num_units=256,
+        self.l_hid1 = lasagne.layers.DenseLayer(
+            self.state_in, num_units=256,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
-        l_hid2 = lasagne.layers.DenseLayer(
-            action_in, num_units=256,
+
+        self.l_hid2 = lasagne.layers.DenseLayer(
+            self.action_in, num_units=256,
             nonlinearity=lasagne.nonlinearities.rectify,
             W=lasagne.init.GlorotUniform())
 	
-        l_sum = lasagne.layers.ElemwiseSumLayer([l_hid1, l_hid2])
+        self.l_sum = lasagne.layers.ElemwiseSumLayer([self.l_hid1, self.l_hid2])
 	
-        l_value = lasagne.layers.DenseLayer(
-            l_sum, num_units=1,
+        self.net = lasagne.layers.DenseLayer(
+            self.l_sum, num_units=1,
             nonlinearity=None,
             W=lasagne.init.GlorotUniform())
 
-        params = lasagne.layers.get_all_params(l_value, trainable=True)
-        prediction = lasagne.layers.get_output(l_value, deterministic=True)
-
-        loss = T.sqr(prediction - input_reward).mean()
-        updates = lasagne.updates.adam(loss, params, learning_rate=learning_rate)
-
-        self.train_fn = theano.function(
-	    [state_in.input_var, action_in.input_var, input_reward],
-	    loss,	
-	    updates=updates)
+        self.output = lasagne.layers.get_output(self.net, deterministic=True)
 
         self.prediction = theano.function(
-	    [state_in.input_var, action_in.input_var],
-	    prediction
+	    [self.input_state, self.input_action],
+	    self.output,
+            allow_input_downcast=True
+
 	)
-
-        self.actor_grad = theano.function(
-            [input_state, input_action],
-            theano.gradient.grad(prediction.sum(), input_action)
-        )
-	
-
-    def train(self, states, actions, td_target):
-        return self.train_fn(states, actions, td_target)
 
     def predict(self, state, action):
         return self.prediction(state, action).squeeze()
 
-    def actor_gradient(self, states, actions):
-        return self.actor_grad(states, actions)
 
+class LearningCritic(TargetCritic):
+
+    def __init__(self, env, learning_rate=0.001):
+        super(LearningCritic, self).__init__(env) 
+
+        self.input_target = T.fvector('input_target')
+
+        params = lasagne.layers.get_all_params(self.net, trainable=True)
+        loss = T.sqr(self.output - self.input_target).mean()
+        updates = lasagne.updates.adam(loss, params, learning_rate=learning_rate)
+
+        self.train = theano.function(
+	    [self.input_state, self.input_action, self.input_target],
+	    loss,	
+	    updates=updates,
+            allow_input_downcast=True
+        )
+
+        self.actor_gradient = theano.function(
+            [self.input_state, self.input_action],
+            theano.gradient.grad(self.output.sum(), self.input_action),
+            allow_input_downcast=True
+        )
+        self.params = params
+  
 
 if __name__ == "__main__":
     np.random.seed(42)
@@ -153,38 +181,46 @@ if __name__ == "__main__":
     gamma = 0.99
 
     env = gym.make('BipedalWalker-v2')
-    # policy = EGreedyPolicy(env)
-    critic = Critic(env)
-    actor = Actor(env)
-    replay_mem = ReplayMemmory(size=1000)
+
+    l_critic = LearningCritic(env)
+    l_actor = LearningActor(env)
+    target_critic = TargetCritic(env)
+    target_actor = TargetActor(env)
+
+    replay_mem = ReplayMemmory(size=10000)
     
     try:
         for ep in range(NUM_EPISODES):
             ep_R = 0.
 	    
             done = False
-            curr_s = env.reset()
+            curr_s = floatX(env.reset())
             losses = []
             while not done:
-                action = actor.get_action(curr_s)
+                action = target_actor.get_action(curr_s)
                 s, r, done, _ = env.step(action)
+                s, r  = floatX(s), floatX(r)
                 done = done or env.hull.position.y < 5.0
-                print(action)
+                # print(action)   
                 replay_mem.add(curr_s, action, r, s, done) 
                 curr_s = s
                
                 if replay_mem.full:
                     states, actions, rewards, next_states, dones = replay_mem.sample()
 
-                    next_q = critic.predict(next_states, actor.get_actions(next_states))
+                    next_q = target_critic.predict(next_states, target_actor.get_actions(next_states))
                     td_targets = rewards + gamma * next_q * dones
-                    c_loss = critic.train(states, actions, td_targets)
+                    c_loss = l_critic.train(states, actions, td_targets)
                     losses.append(c_loss)
 
-                    na = actor.get_actions(states)
-                    actor_grads = critic.actor_gradient(states, na)
-                    actor.train(states, actor_grads)
+                    na = l_actor.get_actions(states)
+                    actor_grads = l_critic.actor_gradient(states, na)
+                    l_actor.train(states, actor_grads)
 
+                    copy_params(l_actor, target_actor)
+                    copy_params(l_critic, target_critic)
+                    
+                    
             ep_R += r
 			        
             print("[Episode {}] Got reward of {} critic loss was {}".format(ep, ep_R, np.mean(losses)))
