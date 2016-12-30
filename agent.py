@@ -48,6 +48,12 @@ def copy_params(src_net, dest_net, tau=0.001):
         dest_p.set_value(tau * src_p + mtau * dest_p.get_value())
 
 
+def ornstein_uhlenbeck_noise(x, t, theta=.2, sigma=.2):
+    W = np.random.normal(scale=sigma/(t+1), size=x.shape)
+    mu = np.zeros(x.shape)
+    return  sigma * W # theta * (mu - x) / t
+
+
 class TargetActor:
 
     def __init__(self, env, snapshot=None):
@@ -101,7 +107,7 @@ class LearningActor(TargetActor):
         self.grad_from_critic = T.fmatrix('c_grads')
 
         params = lasagne.layers.get_all_params(self.net, trainable=True)
-        grads = theano.gradient.grad(None, params, known_grads={self.output: -1 * self.grad_from_critic})
+        grads = theano.gradient.grad(None, params, known_grads={self.output: - self.grad_from_critic})
         updates = lasagne.updates.adam(grads, params, learning_rate=learning_rate)
         
         self.train = theano.function(
@@ -117,7 +123,7 @@ class LearningActor(TargetActor):
 
 class TargetCritic:
     
-    def __init__(self, env, learning_rate=0.001):
+    def __init__(self, env, learning_rate=0.001, snapshot=None):
         self.input_state = T.fmatrix('input_state')
         self.input_action = T.fmatrix('input_action')
 
@@ -127,23 +133,26 @@ class TargetCritic:
         self.l_hid1 = lasagne.layers.DenseLayer(
             self.state_in, num_units=400,
             nonlinearity=lasagne.nonlinearities.rectify,
-            W=lasagne.init.GlorotUniform())
-
-        self.l_acts = lasagne.layers.DenseLayer(
-            self.action_in, num_units=400,
-            nonlinearity=lasagne.nonlinearities.rectify,
-            W=lasagne.init.GlorotUniform())
-	
-        self.l_sum = lasagne.layers.ElemwiseSumLayer([self.l_hid1, self.l_acts])
+            W=lasagne.init.GlorotUniform(),
+            b=None
+        )
 
         self.l_hid2 = lasagne.layers.DenseLayer(
-            self.l_sum, num_units=300,
-            nonlinearity=lasagne.nonlinearities.rectify,
+            self.l_hid1, num_units=300,
+            nonlinearity=None,
             W=lasagne.init.GlorotUniform())
 
+
+        self.l_acts = lasagne.layers.DenseLayer(
+            self.action_in, num_units=300,
+            nonlinearity=None,
+            W=lasagne.init.GlorotUniform())
 	
+        self.l_sum = lasagne.layers.NonlinearityLayer(
+            lasagne.layers.ElemwiseSumLayer([self.l_hid2, self.l_acts]))
+
         self.net = lasagne.layers.DenseLayer(
-            self.l_hid2, num_units=1,
+            self.l_sum, num_units=1,
             nonlinearity=None,
             W=(np.random.sample(size=(300, 1)) * 1e-4 - 5e-5))
 
@@ -181,7 +190,7 @@ class LearningCritic(TargetCritic):
 
         self.actor_gradient = theano.function(
             [self.input_state, self.input_action],
-            theano.gradient.grad(self.output.sum(), self.input_action),
+            theano.gradient.grad(self.output.mean(), self.input_action),
             allow_input_downcast=True
         )
         self.params = params
@@ -189,7 +198,7 @@ class LearningCritic(TargetCritic):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    NUM_EPISODES = 1000
+    NUM_EPISODES = 1000000
     R = 0. # total reward
     max_epr = -np.inf
     gamma = 0.99
@@ -200,26 +209,30 @@ if __name__ == "__main__":
     l_actor = LearningActor(env)
     target_critic = TargetCritic(env)
     target_actor = TargetActor(env)
+    copy_params(l_critic, target_critic, tau=1.)
+    copy_params(l_actor, target_actor, tau=1.)
 
-    replay_mem = ReplayMemmory(size=10000, batch_size=64)
+    replay_mem = ReplayMemmory(size=100000, batch_size=64)
     
     try:
         for ep in range(NUM_EPISODES):
             ep_R = 0.
-	    
+            step = 0
             done = False
             curr_s = floatX(env.reset())
             losses = []
             while not done:
-                action = target_actor.get_action(curr_s)
+                mu_action = target_actor.get_action(curr_s)
+                action = mu_action # + ornstein_uhlenbeck_noise(mu_action, step)
                 s, r, done, _ = env.step(action)
+                if env.hull.position.y < 5.0 or step > 2500:
+                    done = True
+                    r = -100.
                 s, r  = floatX(s), floatX(r)
-                done = done or env.hull.position.y < 4.0
-                # print(action)   
                 replay_mem.add(curr_s, action, r, s, done) 
                 curr_s = s 
                 ep_R += r
-              
+                step += 1
                 if replay_mem.full:
                     states, actions, rewards, next_states, dones = replay_mem.sample()
 
@@ -228,8 +241,7 @@ if __name__ == "__main__":
                     c_loss = l_critic.train(states, actions, td_targets)
                     losses.append(c_loss)
 
-                    na = l_actor.get_actions(states)
-                    actor_grads = l_critic.actor_gradient(states, na)
+                    actor_grads = l_critic.actor_gradient(states, l_actor.get_actions(states))
                     l_actor.train(states, actor_grads)
 
                     copy_params(l_actor, target_actor)
@@ -238,9 +250,10 @@ if __name__ == "__main__":
             if ep_R > max_epr or (ep % 100) == 0:
                 target_actor.save_params("snapshots/{0}_{1:.3f}.pkl".format(ep, ep_R))
                 max_epr = max(ep_R, max_epr)
-                
-            print("[Episode {}] Got reward of {} critic loss was {}".format(ep, ep_R, np.mean(losses)))
-            R += ep_R
+
+            if replay_mem.full:
+                print("[Episode {}] Reward: {} Critic loss: {} steps: {}".format(ep, ep_R, np.mean(losses), step))
+                R += ep_R
 
     except KeyboardInterrupt:
-        print("Got total reward of {} in {} episodes".format(R, ep))
+        print("Got Avg reward of {} in {} episodes".format(R / ep, ep))
